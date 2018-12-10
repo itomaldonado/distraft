@@ -1,11 +1,14 @@
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class EventTimer:
     """Schedules events on a timer
     args:
         - callback: function to call when timer runs out
-        - interval: (class or number) should return or *be* a number to sleep for before callback
+        - interval: (function or number) should return or *be* a number to sleep for before callback
     """
     def __init__(self, interval, callback):
         self.interval = interval

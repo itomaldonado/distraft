@@ -8,6 +8,13 @@ from log import PersistentLog
 
 logger = logging.getLogger(__name__)
 
+# Configuration:
+NUM_SERVERS = 5
+HEARTBEAT_TIMEOUT_LOWER = 0.150
+RESET_LOGS = True
+
+TIME_TO_RUN = 25
+
 
 class NetAddress:
     def __init__(self, host, port):
@@ -34,17 +41,21 @@ class NetAddress:
 class Server:
 
     def __init__(self, host, port, loop):
-        self.id = f'{host}:{port}'
         self.address = NetAddress(host, port)
+        self.id = self.address.full_address
         self.loop = loop
         self.queue = asyncio.Queue(loop=self.loop)
-        self.log = PersistentLog(node_id=f'{host}:{port}',
+        self.log = PersistentLog(node_id=self.id,
                                  log_path='/Users/itomaldonado/git/distraft/logs',
-                                 reset_log=True)
+                                 reset_log=RESET_LOGS)
         self.last_counter = 0
         self.last_receiver = None
+
         # every 50-100 ms (uniformly distributed)
-        self.heartbeat_timer = EventTimer(random.uniform(0.05, 0.1), self.send_data)
+        self.heartbeat_timer = EventTimer(self.generate_timeout, self.send_data)
+
+    def generate_timeout(self):
+        return random.uniform(HEARTBEAT_TIMEOUT_LOWER, 2*HEARTBEAT_TIMEOUT_LOWER)
 
     def handle_network_message(self, data):
         logger.info(f'server_id: {self.id}, Received: {json.dumps(data)}')
@@ -90,19 +101,33 @@ class Server:
 
 def main_networking():
     loop = asyncio.get_event_loop()
-    s1 = Server(host='127.0.0.1', port=8000, loop=loop)
-    s2 = Server(host='127.0.0.1', port=8001, loop=loop)
+    servers = list()
 
-    loop.run_until_complete(s1.start())
-    loop.run_until_complete(s2.start())
+    # Create Servers
+    for i in range(NUM_SERVERS):
+        servers.append(Server(host='127.0.0.1', port=9000+i, loop=loop))
 
-    loop.run_until_complete(s1.send(data={'msg': 'test', 'counter': 1},
-                            dest_host=s2.address.host, dest_port=s2.address.port))
+    # Start servers
+    for server in servers:
+        loop.run_until_complete(server.start())
 
-    loop.run_until_complete(asyncio.sleep(10, loop=loop))
+    # send messeges to start their progress (s_n -> s_n+1)
+    if len(servers) > 1:
+        for i in range(len(servers) - 1):
+            loop.run_until_complete(servers[i].send(data={'msg': 'test', 'counter': 1},
+                                    dest_host=servers[i+1].address.host,
+                                    dest_port=servers[i+1].address.port))
+    # send messege (s_n -> s_0)
+    loop.run_until_complete(servers[-1].send(data={'msg': 'test', 'counter': 1},
+                            dest_host=servers[0].address.host,
+                            dest_port=servers[0].address.port))
 
-    s1.stop()
-    s2.stop()
+    # loop for a while to allow for messages
+    loop.run_until_complete(asyncio.sleep(TIME_TO_RUN, loop=loop))
+
+    # stop servers:
+    for server in servers:
+        server.stop()
 
 
 def _setup_logging(debug):

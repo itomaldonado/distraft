@@ -130,7 +130,7 @@ class PersistentLog(collections.UserList):
 
     @property
     def last_log_index(self):
-        """Index of last log entry staring from _one_"""
+        """Index of last log entry staring from _1_"""
         return len(self.cache)
 
     @property
