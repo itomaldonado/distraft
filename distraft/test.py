@@ -46,7 +46,7 @@ class Server:
         self.loop = loop
         self.queue = asyncio.Queue(loop=self.loop)
         self.log = PersistentLog(node_id=self.id,
-                                 log_path='/Users/itomaldonado/git/distraft/logs',
+                                 log_path='/Users/mmaldonadofigueroa/git/distraft/logs',
                                  reset_log=RESET_LOGS)
         self.last_counter = 0
         self.last_receiver = None

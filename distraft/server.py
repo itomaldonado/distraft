@@ -2,28 +2,35 @@ import asyncio
 import logging
 
 from consensus import Raft
-from flask import Flask, request, jsonify
+from quart import Quart, request, jsonify
 
 logger = logging.getLogger(__name__)
-app = Flask(__name__)
+app = Quart(__name__)
 
 # Configuration:
 NUM_SERVERS = 5
+DEBUG = True
 raft_server = None
 servers = None
-loop = None
 
 
 @app.before_first_request
-def main_networking():
+def _setup_logging():
+    fmt = '[%(asctime)s]: %(levelname)s %(message)s'
+    loglevel = logging.INFO
+    if DEBUG:
+        loglevel = logging.DEBUG
+    logging.basicConfig(format=fmt, level=loglevel)
+
+
+@app.before_first_request
+def _setup_consensus_networking():
     global servers
     global raft_server
-    global loop
     if servers:
         logger.warning("Servers already initialized")
     else:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop = asyncio.get_event_loop()
         server_list = dict()
         servers = list()
 
@@ -34,7 +41,6 @@ def main_networking():
             "tcp_port": 5000,
             "leader": True
         }
-        server_list['127.0.0.1:9000'] = me
         for i in range(1, NUM_SERVERS):
             server_list[f'127.0.0.1:{9000+i}'] = {
                 "host": "127.0.0.1",
@@ -48,8 +54,10 @@ def main_networking():
             udp_port=me['udp_port'],
             tcp_port=me['tcp_port'],
             leader=me['leader'],
+            members=server_list.values(),
             loop=loop
         )
+        server_list['127.0.0.1:9000'] = me
         servers.append(raft_server)
         for i in range(1, NUM_SERVERS):
             m = server_list.pop(f'127.0.0.1:{9000+i}')
@@ -65,32 +73,48 @@ def main_networking():
         # Start servers
         for server in servers:
             logger.info(f'Starting: {server.id}')
-            loop.run_until_complete(server.start())
+            asyncio.ensure_future(server.start(), loop=loop)
 
 
-@app.route("/")
-def hello():
+@app.route("/", methods=['GET'])
+async def root():
     return "Hello World!"
 
 
-@app.route('/set', methods=['POST'])
-def set_value():
+@app.route('/<key>', methods=['POST'])
+async def set_value(key=None):
     global raft_server
-    global loop
-    req = request.get_json()
     try:
-        if req['type'].strip().lower() in ['set']:
-            loop.run_until_complete(raft_server.set_value(req['key'].strip(), req['value'].strip()))
-            return jsonify({'ok': True}), 200
+        form = await request.form
+        if (key and key.strip()) and (form['value'] and form['value'].strip()):
+            k = key.strip()
+            v = form['value'].strip()
+            await raft_server.set_value(k, v)
+            return jsonify({'ok': True, "key": k, "value": v}), 200
         else:
-            return jsonify({'ok': False, 'error': f'unknown request type {req["type"]}'}), 503
+            return jsonify({'ok': False, 'error': f'empty key or value'}), 503
     except Exception as err:
-        logger.error(f'Error in set_value(): {err.message}')
-        return jsonify({'ok': False, 'error': f'system error: {err.message}'}), 500
+        logger.error(f'Error in set_value(): {str(err)}')
+        return jsonify({'ok': False, 'error': f'system error: {str(err)}'}), 500
+
+
+@app.route('/<key>', methods=['GET'])
+async def get_value(key=None):
+    global raft_server
+    try:
+        if key and key.strip():
+            k = key.strip()
+            v = await raft_server.get_value(k)
+            return jsonify({'ok': True, "key": k, "value": v}), 200
+        else:
+            return jsonify({'ok': False, 'error': f'empty key'}), 503
+    except Exception as err:
+        logger.error(f'Error in set_value(): {str(err)}')
+        return jsonify({'ok': False, 'error': f'{str(err)}'}), 500
 
 
 @app.route("/stop")
-def stop():
+async def stop():
     logger.info("Shutting down...")
 
     # stop servers:
@@ -102,15 +126,5 @@ def stop():
         raise RuntimeError('Not running with the Werkzeug Server')
     func()
 
-
-def _setup_logging(debug):
-    fmt = '[%(asctime)s]: %(levelname)s %(message)s'
-    loglevel = logging.INFO
-    if debug:
-        loglevel = logging.DEBUG
-    logging.basicConfig(format=fmt, level=loglevel)
-
-
 if __name__ == '__main__':
-    _setup_logging(True)
     app.run(host='127.0.0.1', port=5000, debug=True)

@@ -10,6 +10,7 @@ NUM_SERVERS = 5
 raft_server = None
 servers = None
 loop = None
+TIME_TO_RUN = 5
 
 
 def main_networking():
@@ -31,7 +32,6 @@ def main_networking():
             "tcp_port": 5000,
             "leader": True
         }
-        server_list['127.0.0.1:9000'] = me
         for i in range(1, NUM_SERVERS):
             server_list[f'127.0.0.1:{9000+i}'] = {
                 "host": "127.0.0.1",
@@ -45,8 +45,10 @@ def main_networking():
             udp_port=me['udp_port'],
             tcp_port=me['tcp_port'],
             leader=me['leader'],
+            members=server_list.values(),
             loop=loop
         )
+        server_list['127.0.0.1:9000'] = me
         servers.append(raft_server)
         for i in range(1, NUM_SERVERS):
             m = server_list.pop(f'127.0.0.1:{9000+i}')
@@ -99,7 +101,16 @@ def _setup_logging(debug):
 if __name__ == '__main__':
     _setup_logging(True)
     main_networking()
+
+    # loop for a while to allow for emtpy heartbeats
+    loop.run_until_complete(asyncio.sleep(TIME_TO_RUN, loop=loop))
+
+    # send some messages:
     set_value({'type': 'set', 'key': 'a', 'value': 1})
-    # set_value({'type': 'set', 'key': 'a', 'value': 2})
-    # set_value({'type': 'set', 'key': 'a', 'value': 3})
+    set_value({'type': 'set', 'key': 'a', 'value': 2})
+    set_value({'type': 'set', 'key': 'a', 'value': 3})
+
+    loop.run_until_complete(asyncio.sleep(TIME_TO_RUN, loop=loop))
+
+    # stop servers:
     stop()

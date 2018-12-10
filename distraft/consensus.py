@@ -3,7 +3,7 @@ import functools
 import random
 import asyncio
 import logging
-from networking import PeerProtocol
+from networking import PeerProtocol, NetAddress
 from timers import EventTimer
 from log import PersistentLog
 
@@ -13,45 +13,6 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_TIMEOUT_LOWER = 0.150
 RESET_LOGS = True
 TIME_TO_RUN = 25
-
-
-class NetAddress:
-    def __init__(self, host, port):
-        self._host = host
-        self._port = port
-
-    @property
-    def host(self):
-        return self._host
-
-    @property
-    def port(self):
-        return self._port
-
-    @property
-    def full_address(self):
-        return f'{self._host}:{self._port}'
-
-    @property
-    def address_touple(self):
-        return self._host, self._port
-
-
-def validate_commit_index(func):
-        """Apply to State Machine everything up to commit index"""
-
-        @functools.wraps(func)
-        def wrapped(self, *args, **kwargs):
-            for not_applied in range(self.log.last_applied + 1, self.log.commit_index + 1):
-                self.log.last_applied += 1
-
-                try:
-                    self.apply_future.set_result(not_applied)
-                except (asyncio.futures.InvalidStateError, AttributeError):
-                    pass
-
-            return func(self, *args, **kwargs)
-        return wrapped
 
 
 class Raft:
@@ -71,6 +32,7 @@ class Raft:
                 ]
             - leader: is this server the leader?
         """
+        self.mem_store = {}
         self.apply_future = None
         self.udp_address = NetAddress(host, udp_port)
         self.tcp_address = NetAddress(host, tcp_port)
@@ -78,17 +40,16 @@ class Raft:
         self.loop = loop
         self.queue = asyncio.Queue(loop=self.loop)
         self._leader = leader
-        self.last_counter = 0
         self.term = 0
         self.request_id = 0
-        self.members = ([
+        self.members = [
             {
                 "udp_address": NetAddress(m['host'], m['udp_port']),
                 "tcp_Address": NetAddress(m['host'], m['tcp_port']),
                 "leader": m['leader']
             }
-            for m in members
-        ] if members else [])
+            for m in members] if members else []
+        logger.debug(f'{self.id} has these members: {self.members}')
 
         # look for the leader and get his info
         if self.leader:
@@ -100,7 +61,7 @@ class Raft:
 
         # Initialize log
         self.log = PersistentLog(node_id=self.id,
-                                 log_path='/Users/itomaldonado/git/distraft/logs',
+                                 log_path='/Users/mmaldonadofigueroa/git/distraft/logs',
                                  reset_log=RESET_LOGS)
         self.last_index = self.log.last_log_index
         self.log.next_index = {
@@ -115,22 +76,25 @@ class Raft:
         self.heartbeat_timer = EventTimer(self.generate_timeout, self.heartbeat)
 
     def generate_timeout(self):
-        return random.uniform(HEARTBEAT_TIMEOUT_LOWER, 2*HEARTBEAT_TIMEOUT_LOWER)
+        to = random.uniform(HEARTBEAT_TIMEOUT_LOWER, 2*HEARTBEAT_TIMEOUT_LOWER)
+        logger.debug(f'Generating timeout of: {to} seconds.')
+        return to
 
     def network_request_handler(self, data):
-        getattr(self.state, 'handle_request_{}'.format(data['type']))(data)
+        logger.debug(f'{self.id} received message of type: {data["type"]}')
+        getattr(self, 'handle_request_{}'.format(data['type']))(data)
 
     def handle_network_message(self, data):
         logger.info(f'server_id: {self.id}, Received: {json.dumps(data)}')
 
         # It's always one entry for now
         for entry in data['entries']:
-            self.log.write(entry['term'], entry['command'])
+            self.__write_log(entry['term'], entry['command'])
 
         # TODO: handle responses
 
     def handle_request_append_entries(self, data):
-        logger.info(f'append_entries_request --> server_id: {self.id}, Received: {json.dumps(data)}')
+        logger.info(f'append_entries_request -> server_id: {self.id}, Received: {json.dumps(data)}')
 
         # It's always one entry for now
         for entry in data['entries']:
@@ -138,32 +102,39 @@ class Raft:
 
         response = {
             'type': 'append_entries_response',
-            'term': self.storage.term,
+            'term': self.term,
             'success': True,
-
             'request_id': data['request_id']
         }
-        asyncio.ensure_future(self.state.send(response, data['sender']), loop=self.loop)
+        asyncio.ensure_future(
+            self.send(
+                response,
+                dest_host=data['sender'][0],
+                dest_port=data['sender'][1]
+            ),
+            loop=self.loop
+        )
 
-    @validate_commit_index
     def handle_request_append_entries_response(self, data):
         logger.info(
             f'append_entries_response --> server_id: {self.id}, Received: {json.dumps(data)}'
         )
 
     def heartbeat(self):
-        self.last_counter += 1
         self.request_id += 1
+        logger.debug(f'Performing heartbeat() with request id: {self.request_id}')
         asyncio.ensure_future(self.append_entries(), loop=self.loop)
 
     async def append_entries(self):
+        logger.debug(f'sending append_entries RPC to {len(self.members)} members')
         for m in self.members:
+            logger.debug(f'sending to member: {m}')
             data = {
                 'type': 'append_entries',
                 'term': self.term,
                 'leader_id': self.id,
                 'commit_index': self.log.commit_index,
-                'request_id': self.last_counter,
+                'request_id': self.request_id,
                 'entries': []
             }
 
@@ -179,7 +150,7 @@ class Raft:
                 'prev_log_term': self.log[prev_index]['term'] if self.log and prev_index else 0
             })
 
-            logger.info(f'Sending data: {data} to {m.udp_address.full_address}')
+            logger.info(f'Sending data: {data} to {m["udp_address"].full_address}')
 
             host = m['udp_address'].host
             port = m['udp_address'].port
@@ -188,13 +159,15 @@ class Raft:
                 loop=self.loop
             )
 
-        if self.apply_future:
+        try:
             self.apply_future.set_result({'ok': True})
+        except (asyncio.futures.InvalidStateError, AttributeError):
+            pass
 
     async def start(self):
         protocol = PeerProtocol(
             network_queue=self.queue,
-            network_request_handler=self.handle_network_message,
+            network_request_handler=self.network_request_handler,
             loop=self.loop
         )
         self.transport, _ = await asyncio.Task(
@@ -203,6 +176,7 @@ class Raft:
             loop=self.loop
         )
         if self.leader:
+            logger.info(f'I am server {self.id} and I am the leader.')
             self.heartbeat_timer.start()
 
     def stop(self):
@@ -240,15 +214,21 @@ class Raft:
     def leader_address(self):
         return self._leader_address
 
+    def __write_log(self, term, command={}):
+        logger.info(f'{self.id} log: writing --> term:{self.term}, command: {command}')
+        self.log.write(self.term, command)
+
     async def execute_command(self, command):
         """Write to persistent log & send AppendEntries() RPC"""
         self.apply_future = asyncio.Future(loop=self.loop)
-
-        logger.info(f'writing --> term:{self.term}, command: {command}')
-        self.log.write(self.term, command)
+        self.__write_log(self.term, command)
         asyncio.ensure_future(self.append_entries(), loop=self.loop)
 
         await self.apply_future
 
-    async def set_value(self, name, value):
-        await self.execute_command({name: value})
+    async def set_value(self, key, value):
+        await self.execute_command({key: value})
+        self.mem_store[key] = value
+
+    async def get_value(self, key):
+        return self.mem_store.get(key, None)
