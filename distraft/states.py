@@ -1,8 +1,22 @@
 import asyncio
 import functools
 import logging
+import random
+
+from timers import EventTimer
+from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+HEARTBEAT_TIMEOUT_LOWER = 0.150
+ELECTION_TIMEOUT_LOWER = 0.200
+TIMEOUT_SPREAD_RATIO = 2.0
+
+
+class States(Enum):
+    FOLLOWER = 0
+    CANDIDATE = 1
+    LEADER = 3
 
 
 def validate_commit_index(func):
@@ -31,37 +45,34 @@ def validate_term(func):
     """
 
     @functools.wraps(func)
-    def on_receive_function(self, data):
+    def handle_message_function(self, data):
         if self.storage.term < data['term']:
-            self.storage.update({
-                'term': data['term']
-            })
+            self.storage.update({'term': data['term']})
             if not isinstance(self, Follower):
-                self.state.to_follower()
+                self.raft.to_state(States.FOLLOWER)
 
         if self.storage.term > data['term'] and not data['type'].endswith('_response'):
             response = {
-                'type': '{}_response'.format(data['type']),
+                'success': False,
                 'term': self.storage.term,
-                'success': False
+                'type': f'{data["type"]}_response',
             }
-            asyncio.ensure_future(self.state.send(response, data['sender']), loop=self.loop)
+            asyncio.ensure_future(self.raft.send(response, data['sender']), loop=self.loop)
             return
 
         return func(self, data)
-    return on_receive_function
+    return handle_message_function
 
 
-class BaseState:
-    def __init__(self, state):
-        self.state = state
-
-        self.storage = self.state.storage
-        self.log = self.state.log
-        self.state_machine = self.state.state_machine
-
-        self.id = self.state.id
-        self.loop = self.state.loop
+class State:
+    def __init__(self, raft=None):
+        """This is the base state class that all other states must implement"""
+        self.raft = raft
+        self.storage = self.raft.state_storage
+        self.log = self.raft.log
+        self.state_machine = self.raft.state_machine
+        self.id = self.raft.id
+        self.loop = self.raft.loop
 
     @validate_term
     def handle_message_request_vote(self, data):
@@ -155,13 +166,141 @@ class BaseState:
         """
 
 
-class Follower(BaseState):
+class Follower(State):
+    """Raft server's Follower state:
+
+    - this state will to RPCs from candidates and leaders
+    — if the election_timer times out without receiving a heartbeat (AppendEntries RPC) from the
+        current/later term's leader, or granting vote to candidate: transition to candidate state
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.election_timer = EventTimer(Follower.generate_election_timeout, self.to_candidate)
+
+    def start(self):
+        # (always) set vote to None
+        self.storage.update({'vote': None})
+
+        # (if unexistent) set term to zero"""
+        if not self.storage.exists('term'):
+            self.storage.update({'term': 0})
+
+        # start election timer
+        self.election_timer.start()
+
+    def stop(self):
+        # stop the election timer
+        self.election_timer.stop()
+
+    @staticmethod
+    def generate_election_timeout():
+        to = random.uniform(
+            float(HEARTBEAT_TIMEOUT_LOWER),
+            float(TIMEOUT_SPREAD_RATIO*HEARTBEAT_TIMEOUT_LOWER)
+        )
+        logger.debug(f'Generating timeout of: {to} seconds.')
+        return to
+
+    @validate_commit_index
+    @validate_term
+    def handle_append_entries(self, data):
+        
+        self.raft.set_leader(data['leader_id'])
+
+        # Reply False if log doesn’t contain an entry at prev_log_index whose term matches prev_log_term
+        try:
+            prev_log_index = data['prev_log_index']
+            if prev_log_index > self.log.last_log_index or (
+                prev_log_index and self.log[prev_log_index]['term'] != data['prev_log_term']
+            ):
+                response = {
+                    'type': 'append_entries_response',
+                    'term': self.storage.term,
+                    'success': False,
+
+                    'request_id': data['request_id']
+                }
+                asyncio.ensure_future(self.state.send(response, data['sender']), loop=self.loop)
+                return
+        except IndexError:
+            pass
+
+        # If an existing entry conflicts with a new one (same index but different terms),
+        # delete the existing entry and all that follow it
+        new_index = data['prev_log_index'] + 1
+        try:
+            if self.log[new_index]['term'] != data['term'] or (
+                self.log.last_log_index != prev_log_index
+            ):
+                self.log.erase_from(new_index)
+        except IndexError:
+            pass
+
+        # It's always one entry for now
+        for entry in data['entries']:
+            self.log.write(entry['term'], entry['command'])
+
+        # Update commit index if necessary
+        if self.log.commit_index < data['commit_index']:
+            self.log.commit_index = min(data['commit_index'], self.log.last_log_index)
+
+        # Respond True since entry matching prev_log_index and prev_log_term was found
+        response = {
+            'type': 'append_entries_response',
+            'term': self.storage.term,
+            'success': True,
+
+            'last_log_index': self.log.last_log_index,
+            'request_id': data['request_id']
+        }
+        asyncio.ensure_future(self.state.send(response, data['sender']), loop=self.loop)
+
+        self.election_timer.reset()
+
+    @validate_term
+    def handle_request_vote(self, data):
+        """Handle a RequestVote RPC, details:
+
+        The candidate's log has to **always** be up-to-date (equal or better data).
+
+        Here are some rules for comparing local vs candidate logs:
+            - last entries with different terms, then the log with the later term is more up-to-date
+            - logs that end with the same term, then whichever log is longer is more up-to-date
+        """
+
+        # If you have voted for this term, don't vote again~
+        if self.storage.voted is None:
+
+            # if last log term entry are different
+            if data['last_log_term'] != self.log.last_log_term:
+                # larger term wins
+                vote = data['last_log_term'] > self.log.last_log_term
+            # if equal terms, longer log (larger index) wins
+            else:
+                vote = data['last_log_index'] >= self.log.last_log_index
+
+            # construct response
+            response = {
+                'type': 'request_vote_response',
+                'term': self.storage.term,
+                'vote_granted': vote
+            }
+
+            # if going to vote for the candidate, udpate local storage
+            if vote:
+                self.storage.update({'voted_for': data['candidate_id']})
+
+            # send response to sender
+            asyncio.ensure_future(self.raft.send(response, data['sender']), loop=self.loop)
+
+    def to_candidate(self):
+        self.raft.to_state(States.CANDIDATE)
+
+
+class Candidate(State):
     pass
 
 
-class Candidate(BaseState):
-    pass
-
-
-class Leader(BaseState):
+class Leader(State):
     pass

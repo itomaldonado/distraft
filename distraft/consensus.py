@@ -1,11 +1,12 @@
-import json
-import functools
-import random
 import asyncio
+import json
 import logging
+import os
+import random
+
 from networking import PeerProtocol, NetAddress
 from timers import EventTimer
-from log import PersistentLog
+from storage import PersistentLog, PersistentDict
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +14,7 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_TIMEOUT_LOWER = 0.150
 RESET_LOGS = True
 TIME_TO_RUN = 25
+LOG_PATH = '/Users/mmaldonadofigueroa/git/distraft/logs'
 
 
 class Raft:
@@ -61,7 +63,7 @@ class Raft:
 
         # Initialize log
         self.log = PersistentLog(node_id=self.id,
-                                 log_path='/Users/mmaldonadofigueroa/git/distraft/logs',
+                                 log_path=LOG_PATH,
                                  reset_log=RESET_LOGS)
         self.last_index = self.log.last_log_index
         self.log.next_index = {
@@ -232,3 +234,18 @@ class Raft:
 
     async def get_value(self, key):
         return self.mem_store.get(key, None)
+
+
+class StateMachine(PersistentDict):
+    """Raft Replicated State Machine — a persistent dictionary"""
+
+    def __init__(self, node_id, data_path=None):
+        self.node_id = node_id
+        if not data_path:
+            data_path = '/var/lib/distraft'
+            self.data_filename = os.path.join(data_path, f'{self.node_id}.data')
+        super().__init__(self.data_filename)
+
+    def commit(self, command):
+        """Commit a command to State Machine"""
+        self.update(command)

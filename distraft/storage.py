@@ -7,6 +7,50 @@ import collections
 logger = logging.getLogger(__name__)
 
 
+class PersistentDict(collections.UserDict):
+    """A Dictionary data structure that is automagically persisted to disk as json."""
+    def __init__(self, path=None, reset=False, data={}):
+        # set persistent dict's path variable
+        self.filename = os.path.dirname(path)
+
+        # create file's directory structure if it doesn't exist
+        os.makedirs(self.filename, exist_ok=True)
+
+        # open log in 'append' mode
+        open(self.filename, 'a').close()
+
+        if reset and os.path.isfile(self.filename):
+            # remove old log
+            os.remove(self.filename)
+            # touch/create new empty log
+            open(self.filename, 'a').close()
+            logger.debug('Reseting persistent dictionary.')
+        elif os.path.isfile(self.filename):
+            logger.debug('Using existing persistent dictionary.')
+
+        # load the data from file
+        if os.path.isfile(path):
+            with open(path, 'r') as f:
+                data = json.loads(f.read())
+
+        super().__init__(data)
+
+    def __setitem__(self, key, value):
+        self.data[self.__keytransform__(key)] = value
+        self.persist()
+
+    def __delitem__(self, key):
+        del self.data[self.__keytransform__(key)]
+        self.persist()
+
+    def __keytransform__(self, key):
+        return key
+
+    def persist(self):
+        with open(self.path, 'w+') as f:
+            f.write(json.dumps(self.data))
+
+
 class PersistentLog(collections.UserList):
     """Persistent Raft's replicated log on disk
     Log entry structure:
@@ -19,10 +63,10 @@ class PersistentLog(collections.UserList):
     UPDATE_CACHE_COUNTER = 25
     SERIALIZER = False
 
-    def __init__(self, node_id, log_path=None, reset_log=False):
+    def __init__(self, node_id, log_path=None, reset=False):
 
         self.cache = list()
-        self.__init_log_and_cache(node_id, log_path=log_path, reset_log=reset_log)
+        self.__init_log_and_cache(node_id, log_path=log_path, reset=reset)
 
         # Volatile states (lost after restart)
 
@@ -56,7 +100,7 @@ class PersistentLog(collections.UserList):
         """
         self.match_index = {}
 
-    def __init_log_and_cache(self, node_id, log_path=None, reset_log=False):
+    def __init_log_and_cache(self, node_id, log_path=None, reset=False):
         logger.debug('Initializing log')
 
         # filename should be "<log_path>/ip_port.log"
@@ -68,7 +112,7 @@ class PersistentLog(collections.UserList):
         # open log in 'append' mode
         open(self.filename, 'a').close()
 
-        if reset_log and os.path.isfile(self.filename):
+        if reset and os.path.isfile(self.filename):
             # remove old log
             os.remove(self.filename)
             # touch/create new empty log
