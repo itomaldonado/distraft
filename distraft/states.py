@@ -14,15 +14,16 @@ TIMEOUT_SPREAD_RATIO = 2.0
 
 
 class States(Enum):
+    """Enumerate the states a node can take"""
     FOLLOWER = 0
     CANDIDATE = 1
     LEADER = 3
 
 
-def validate_commit_index(func):
+def validate_commit_index(fun):
         """Apply to State Machine everything up to commit index"""
 
-        @functools.wraps(func)
+        @functools.wraps(fun)
         def wrapped(self, *args, **kwargs):
             for not_applied in range(self.log.last_applied + 1, self.log.commit_index + 1):
                 self.log.last_applied += 1
@@ -32,19 +33,19 @@ def validate_commit_index(func):
                 except (asyncio.futures.InvalidStateError, AttributeError):
                     pass
 
-            return func(self, *args, **kwargs)
+            return fun(self, *args, **kwargs)
         return wrapped
 
 
-def validate_term(func):
-    """Compares current term and request term:
-        if current term is stale:
-            update current term & become follower
-        if received term is stale:
-            respond with False
-    """
+def validate_term(fun):
+    """Compares current local (node's) term and request (sender's) term:
 
-    @functools.wraps(func)
+    - if current local (node's) term is older:
+        update current local (node's) term and become a follower
+    - if request (sender's) term is older:
+        respond with {'success': False}
+    """
+    @functools.wraps(fun)
     def handle_message_function(self, data):
         if self.storage.term < data['term']:
             self.storage.update({'term': data['term']})
@@ -60,7 +61,7 @@ def validate_term(func):
             asyncio.ensure_future(self.raft.send(response, data['sender']), loop=self.loop)
             return
 
-        return func(self, data)
+        return fun(self, data)
     return handle_message_function
 
 
