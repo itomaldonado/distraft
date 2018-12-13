@@ -6,15 +6,18 @@ import collections
 
 logger = logging.getLogger(__name__)
 
+# Config:
+UPDATE_CACHE_COUNTER = 5
 
-class PersistentDict(collections.UserDict):
+
+class PersistentDict(collections.MutableMapping):
     """A Dictionary data structure that is automagically persisted to disk as json."""
-    def __init__(self, path=None, reset=False, data={}):
+    def __init__(self, path=None, reset=False, data=None):
         # set persistent dict's path variable
         self.filename = os.path.dirname(path)
 
         # create file's directory structure if it doesn't exist
-        os.makedirs(self.filename, exist_ok=True)
+        os.makedirs(os.path.dirname(self.filename), exist_ok=True)
 
         # open log in 'append' mode
         open(self.filename, 'a').close()
@@ -29,6 +32,7 @@ class PersistentDict(collections.UserDict):
             logger.debug('Using existing persistent dictionary.')
 
         # load the data from file
+        data = data if data else {}
         if os.path.isfile(path):
             with open(path, 'r') as f:
                 data = json.loads(f.read())
@@ -59,14 +63,9 @@ class PersistentLog(collections.UserList):
     Then entry's index is its corresponding line number
     """
 
-    # update the cache every <counter> entries
-    UPDATE_CACHE_COUNTER = 25
-    SERIALIZER = False
+    def __init__(self, data, node_id=None, log_path=None, reset=False):
 
-    def __init__(self, node_id, log_path=None, reset=False):
-
-        self.cache = list()
-        self.__init_log_and_cache(node_id, log_path=log_path, reset=reset)
+        logger.debug('Initializing persistent log')
 
         # Volatile states (lost after restart)
 
@@ -100,13 +99,10 @@ class PersistentLog(collections.UserList):
         """
         self.match_index = {}
 
-    def __init_log_and_cache(self, node_id, log_path=None, reset=False):
-        logger.debug('Initializing log')
-
         # filename should be "<log_path>/ip_port.log"
         self.filename = os.path.join(log_path, f'{node_id.replace(":", "_")}.log'.format())
 
-        # create log's directory structure if it doesn't exist
+        # create file's directory structure if it doesn't exist
         os.makedirs(os.path.dirname(self.filename), exist_ok=True)
 
         # open log in 'append' mode
@@ -119,12 +115,21 @@ class PersistentLog(collections.UserList):
             open(self.filename, 'a').close()
             logger.debug('Reseting persistent log.')
         elif os.path.isfile(self.filename):
-            logger.debug('Using existing persistent log')
+            logger.debug('Using existing persistent log.')
 
-        self.cache = self.read()
+        # load the data from file
+        data = data if data else {}
+        data = self.read()
+
+        # we use a cache instead of the self.data because
+        # self.data may be overritten by other methods, so until we
+        # implement those methods I'd rather use self.cache
+        self.cache = data
+        # super().__init__(data)
 
     def __getitem__(self, index):
-        return self.cache[index - 1]
+        # return self.cache[index - 1]
+        return self.cache[index]
 
     def __bool__(self):
         return bool(self.cache)
@@ -148,15 +153,11 @@ class PersistentLog(collections.UserList):
 
     def write(self, term, command):
         with open(self.filename, 'ab') as log_file:
-            entry = {
-                'term': term,
-                'command': command
-            }
+            entry = {'term': term, 'command': command}
             log_file.write(self.__pack(entry) + '\n'.encode())
-
         self.cache.append(entry)
-        if not len(self) % self.UPDATE_CACHE_COUNTER:
-            self.cache = self.read()
+        # if not len(self) % UPDATE_CACHE_COUNTER:
+        #     self.cache = self.read()
 
         return entry
 
@@ -164,22 +165,34 @@ class PersistentLog(collections.UserList):
         with open(self.filename, 'rb') as f:
             return [self.__unpack(entry) for entry in f.readlines()]
 
-    def erase_from(self, index):
-        updated = self.cache[:index - 1]
+    def delete_from(self, index):
+        # updated = self.cache[:index - 1]
+        updated = self.cache[:index]
         open(self.filename, 'wb').close()
         self.cache = []
-
         for entry in updated:
             self.write(entry['term'], entry['command'])
 
     @property
     def last_log_index(self):
-        """Index of last log entry staring from _1_"""
-        return len(self.cache)
+        """Index of last log entry staring from _0_"""
+        return (len(self.cache) - 1)
 
     @property
     def last_log_term(self):
         if self.cache:
             return self.cache[-1]['term']
-
         return 0
+
+
+class PersistentStateMachine(PersistentDict):
+    """Raft Replicated State Machine — a persistent dictionary"""
+
+    def __init__(self, node_id, path=None, reset=False):
+        self.node_id = node_id
+        self.data_filename = os.path.join(path, f'{self.node_id}.data')
+        super().__init__(path=self.data_filename, reset=reset)
+
+    def commit(self, command):
+        """Commit a command to State Machine"""
+        self.update(command)
