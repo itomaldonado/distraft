@@ -8,13 +8,14 @@ logger = logging.getLogger(__name__)
 
 # Config:
 UPDATE_CACHE_COUNTER = 5
+SERIALIZER = False
 
 
-class PersistentDict(collections.MutableMapping):
+class PersistentDict(collections.UserDict):
     """A Dictionary data structure that is automagically persisted to disk as json."""
-    def __init__(self, path=None, reset=False, data=None):
+    def __init__(self, data=None, path=None, reset=False):
         # set persistent dict's path variable
-        self.filename = os.path.dirname(path)
+        self.filename = path
 
         # create file's directory structure if it doesn't exist
         os.makedirs(os.path.dirname(self.filename), exist_ok=True)
@@ -25,16 +26,17 @@ class PersistentDict(collections.MutableMapping):
         if reset and os.path.isfile(self.filename):
             # remove old log
             os.remove(self.filename)
-            # touch/create new empty log
-            open(self.filename, 'a').close()
+            # touch/create new empty dict
+            with open(self.filename, 'a') as f:
+                f.writelines(['{}'])
             logger.debug('Reseting persistent dictionary.')
         elif os.path.isfile(self.filename):
             logger.debug('Using existing persistent dictionary.')
 
         # load the data from file
         data = data if data else {}
-        if os.path.isfile(path):
-            with open(path, 'r') as f:
+        if os.path.isfile(self.filename):
+            with open(self.filename, 'r') as f:
                 data = json.loads(f.read())
 
         super().__init__(data)
@@ -51,7 +53,7 @@ class PersistentDict(collections.MutableMapping):
         return key
 
     def persist(self):
-        with open(self.path, 'w+') as f:
+        with open(self.filename, 'w+') as f:
             f.write(json.dumps(self.data))
 
 
@@ -63,7 +65,7 @@ class PersistentLog(collections.UserList):
     Then entry's index is its corresponding line number
     """
 
-    def __init__(self, data, node_id=None, log_path=None, reset=False):
+    def __init__(self, data=None, node_id=None, log_path=None, reset=False):
 
         logger.debug('Initializing persistent log')
 
@@ -128,8 +130,8 @@ class PersistentLog(collections.UserList):
         # super().__init__(data)
 
     def __getitem__(self, index):
-        # return self.cache[index - 1]
-        return self.cache[index]
+        logger.debug(f'Get log entry at: {index}')
+        return self.cache[index - 1]
 
     def __bool__(self):
         return bool(self.cache)
@@ -138,13 +140,13 @@ class PersistentLog(collections.UserList):
         return len(self.cache)
 
     def __pack(self, data):
-        if self.SERIALIZER:
+        if SERIALIZER:
             return msgpack.packb(data, use_bin_type=True)
         else:
             return json.dumps(data).encode()
 
     def __unpack(self, data):
-        if self.SERIALIZER:
+        if SERIALIZER:
             # TODO: find out how to unpack multi-line messages
             return msgpack.unpackb(data, use_list=True, encoding='utf-8')
         else:
@@ -152,6 +154,7 @@ class PersistentLog(collections.UserList):
             return json.loads(decoded)
 
     def write(self, term, command):
+        logger.debug(f'Write entry "{command}"" at: {len(self.cache)}')
         with open(self.filename, 'ab') as log_file:
             entry = {'term': term, 'command': command}
             log_file.write(self.__pack(entry) + '\n'.encode())
@@ -175,8 +178,8 @@ class PersistentLog(collections.UserList):
 
     @property
     def last_log_index(self):
-        """Index of last log entry staring from _0_"""
-        return (len(self.cache) - 1)
+        """Index of last log entry staring from 1"""
+        return (len(self.cache))
 
     @property
     def last_log_term(self):
@@ -188,9 +191,9 @@ class PersistentLog(collections.UserList):
 class PersistentStateMachine(PersistentDict):
     """Raft Replicated State Machine — a persistent dictionary"""
 
-    def __init__(self, node_id, path=None, reset=False):
+    def __init__(self, node_id=None, path=None, reset=False):
         self.node_id = node_id
-        self.data_filename = os.path.join(path, f'{self.node_id}.data')
+        self.data_filename = os.path.join(path, f'{self.node_id.replace(":", "_")}.data')
         super().__init__(path=self.data_filename, reset=reset)
 
     def commit(self, command):

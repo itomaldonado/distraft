@@ -6,34 +6,6 @@ import msgpack
 logger = logging.getLogger(__name__)
 
 
-class NetAddress:
-    def __init__(self, host, port):
-        self._host = host
-        self._port = port
-
-    @property
-    def host(self):
-        return self._host
-
-    @property
-    def port(self):
-        return self._port
-
-    @property
-    def full_address(self):
-        return f'{self._host}:{self._port}'
-
-    @property
-    def address_touple(self):
-        return self._host, self._port
-
-    def __str__(self):
-        return self.full_address
-
-    def __repr__(self):
-        return self.full_address
-
-
 class PeerProtocol(asyncio.DatagramProtocol):
     SERIALIZER = True
 
@@ -62,6 +34,8 @@ class PeerProtocol(asyncio.DatagramProtocol):
         while not self.transport.is_closing():
             request = await self.network_queue.get()
             data = self.__pack(request['data'])
+            logger.debug(f'Sending message of type: "{request["data"]["type"]}" '
+                         f'to {request["destination"]}')
             self.transport.sendto(data, request['destination'])
 
     def connection_made(self, transport):

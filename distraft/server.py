@@ -10,11 +10,10 @@ app = Quart(__name__)
 # Configuration:
 NUM_SERVERS = 5
 DEBUG = True
-raft_server = None
 servers = None
+loop = None
 
 
-@app.before_first_request
 def _setup_logging():
     fmt = '[%(asctime)s]: %(levelname)s %(message)s'
     loglevel = logging.INFO
@@ -23,57 +22,44 @@ def _setup_logging():
     logging.basicConfig(format=fmt, level=loglevel)
 
 
-@app.before_first_request
 def _setup_consensus_networking():
     global servers
-    global raft_server
+    global loop
     if servers:
         logger.warning("Servers already initialized")
     else:
         loop = asyncio.get_event_loop()
         server_list = dict()
-        servers = list()
+        servers = dict()
 
         # Create Servers
-        me = {
-            "host": "127.0.0.1",
-            "udp_port": 9000,
-            "tcp_port": 5000,
-            "leader": True
-        }
-        for i in range(1, NUM_SERVERS):
-            server_list[f'127.0.0.1:{9000+i}'] = {
-                "host": "127.0.0.1",
-                "udp_port": 9000+i,
-                "tcp_port": 5000+i,
-                "leader": False
-            }
+        for i in range(0, NUM_SERVERS):
+            m = ("127.0.0.1", 9000+i, 5000+i)
+            server_list.update({f'{m[0]}:{m[1]}:{m[2]}': m})
 
-        raft_server = Raft(
-            host=me['host'],
-            udp_port=me['udp_port'],
-            tcp_port=me['tcp_port'],
-            leader=me['leader'],
-            members=server_list.values(),
-            loop=loop
-        )
-        server_list['127.0.0.1:9000'] = me
-        servers.append(raft_server)
-        for i in range(1, NUM_SERVERS):
-            m = server_list.pop(f'127.0.0.1:{9000+i}')
-            servers.append(Raft(
-                host='127.0.0.1',
-                udp_port=9000+i,
-                tcp_port=5000+i,
-                members=server_list.values(),
-                loop=loop
-            ))
-            server_list[f'127.0.0.1:{9000+i}'] = m
+        for i in range(0, NUM_SERVERS):
+            m = server_list.pop(f'127.0.0.1:{9000+i}:{5000+i}')
+            servers.update(
+                {f'127.0.0.1:{9000+i}:{5000+i}': Raft(
+                    host='127.0.0.1',
+                    udp_port=9000+i,
+                    tcp_port=5000+i,
+                    members=server_list.values(),
+                    loop=loop)}
+            )
+            server_list.update({f'127.0.0.1:{9000+i}:{5000+i}': m})
 
         # Start servers
-        for server in servers:
-            logger.info(f'Starting: {server.id}')
+        for server_id, server in servers.items():
+            logger.info(f'Starting: {server_id}')
             asyncio.ensure_future(server.start(), loop=loop)
+
+
+def get_leader():
+    global servers
+    for server_id, server in servers.items():
+        if (server.leader and server.up):
+            return servers[server.leader]
 
 
 @app.route("/", methods=['GET'])
@@ -83,7 +69,7 @@ async def root():
 
 @app.route('/<key>', methods=['POST'])
 async def set_value(key=None):
-    global raft_server
+    raft_server = get_leader()
     try:
         form = await request.form
         if (key and key.strip()) and (form['value'] and form['value'].strip()):
@@ -100,7 +86,7 @@ async def set_value(key=None):
 
 @app.route('/<key>', methods=['GET'])
 async def get_value(key=None):
-    global raft_server
+    raft_server = get_leader()
     try:
         if key and key.strip():
             k = key.strip()
@@ -113,18 +99,63 @@ async def get_value(key=None):
         return jsonify({'ok': False, 'error': f'{str(err)}'}), 500
 
 
-@app.route("/stop")
-async def stop():
-    logger.info("Shutting down...")
+@app.route('/status', methods=['GET'])
+async def get_server_status(key=None):
+    global servers
+    status = {}
+    leader = get_leader()
+    leader = leader.id if leader else None
+    status.update(
+        {
+            'leader': leader,
+            'members': [
+                {
+                    'id': m.id,
+                    'leader': m.leader,
+                    'state': m.state.name,
+                    'commit_index': m.log.commit_index,
+                    'last_applied': m.log.last_applied,
+                    'last_log_index': m.log.last_log_index,
+                    'last_log_term': m.log.last_log_term,
+                    'status': m.up,
+                    'term': m.state_storage.get('term')
 
-    # stop servers:
-    for server in servers:
+                } for m in servers.values()
+            ]
+        }
+    )
+    return jsonify({'ok': True, 'status': status}), 200
+
+
+@app.route("/stop/<server_id>")
+async def stop(server_id):
+    logger.info(f'Shutting down server: {server_id}...')
+    global servers
+
+    # stop server
+    server = servers.get(server_id)
+    logger.debug(f'Got raft server: {server.id}')
+    if (server and server.up):
         server.stop()
 
-    func = request.environ.get('werkzeug.server.shutdown')
-    if func is None:
-        raise RuntimeError('Not running with the Werkzeug Server')
-    func()
+    return jsonify({'ok': True}), 200
+
+
+@app.route("/start/<server_id>")
+async def start(server_id):
+    logger.info(f'Starting server: {server_id}...')
+    global servers
+    global loop
+
+    # stop server
+    server = servers.get(server_id)
+    if (server and not server.up):
+        asyncio.ensure_future(server.start(), loop=loop)
+
+    return jsonify({'ok': True}), 200
+
 
 if __name__ == '__main__':
+    _setup_logging()
+    _setup_consensus_networking()
     app.run(host='127.0.0.1', port=5000, debug=True)
