@@ -22,4 +22,4 @@ EXPOSE 5000/tcp
 
 # Entry point
 WORKDIR /home/python/distraft
-ENTRYPOINT ["python", "./distapp.py"]
+ENTRYPOINT ["python", "./server.py"]

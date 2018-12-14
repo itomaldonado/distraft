@@ -1,0 +1,63 @@
+version: '2'
+
+services:
+  server1:
+    build: ./
+    container_name: "server1"
+    ports:
+      - "5001:5000/tcp"
+    environment:
+      - DISTRAFT_LOG_LEVEL=DEBUG
+      - DISTRAFT_PRETTY_PRINT_RESPONSES=True
+      - DISTRAFT_NAME=server1
+      - DISTRAFT_HOST=0.0.0.0
+      - DISTRAFT_CLIENT_HOST=0.0.0.0
+      - 'DISTRAFT_CLUSTER=server1=server1:9000:127.0.0.1:5001,server2=server2:9000:127.0.0.1:5002,server3=server3:9000:127.0.0.1:5003,server4=server4:9000:127.0.0.1:5004,server5=server5:9000:127.0.0.1:5005'
+  server2:
+    build: ./
+    container_name: "server2"
+    ports:
+      - "5002:5000/tcp"
+    environment:
+      - DISTRAFT_LOG_LEVEL=DEBUG
+      - DISTRAFT_PRETTY_PRINT_RESPONSES=True
+      - DISTRAFT_NAME=server2
+      - DISTRAFT_HOST=0.0.0.0
+      - DISTRAFT_CLIENT_HOST=0.0.0.0
+      - 'DISTRAFT_CLUSTER=server1=server1:9000:127.0.0.1:5001,server2=server2:9000:127.0.0.1:5002,server3=server3:9000:127.0.0.1:5003,server4=server4:9000:127.0.0.1:5004,server5=server5:9000:127.0.0.1:5005'
+  server3:
+    build: ./
+    container_name: "server3"
+    ports:
+      - "5003:5000/tcp"
+    environment:
+      - DISTRAFT_LOG_LEVEL=DEBUG
+      - DISTRAFT_PRETTY_PRINT_RESPONSES=True
+      - DISTRAFT_NAME=server3
+      - DISTRAFT_HOST=0.0.0.0
+      - DISTRAFT_CLIENT_HOST=0.0.0.0
+      - 'DISTRAFT_CLUSTER=server1=server1:9000:127.0.0.1:5001,server2=server2:9000:127.0.0.1:5002,server3=server3:9000:127.0.0.1:5003,server4=server4:9000:127.0.0.1:5004,server5=server5:9000:127.0.0.1:5005'
+  server4:
+    build: ./
+    container_name: "server4"
+    ports:
+      - "5004:5000/tcp"
+    environment:
+      - DISTRAFT_LOG_LEVEL=DEBUG
+      - DISTRAFT_PRETTY_PRINT_RESPONSES=True
+      - DISTRAFT_NAME=server4
+      - DISTRAFT_HOST=0.0.0.0
+      - DISTRAFT_CLIENT_HOST=0.0.0.0
+      - 'DISTRAFT_CLUSTER=server1=server1:9000:127.0.0.1:5001,server2=server2:9000:127.0.0.1:5002,server3=server3:9000:127.0.0.1:5003,server4=server4:9000:127.0.0.1:5004,server5=server5:9000:127.0.0.1:5005'
+  server5:
+    build: ./
+    container_name: "server5"
+    ports:
+      - "5005:5000/tcp"
+    environment:
+      - DISTRAFT_LOG_LEVEL=DEBUG
+      - DISTRAFT_PRETTY_PRINT_RESPONSES=True
+      - DISTRAFT_NAME=server5
+      - DISTRAFT_HOST=0.0.0.0
+      - DISTRAFT_CLIENT_HOST=0.0.0.0
+      - 'DISTRAFT_CLUSTER=server1=server1:9000:127.0.0.1:5001,server2=server2:9000:127.0.0.1:5002,server3=server3:9000:127.0.0.1:5003,server4=server4:9000:127.0.0.1:5004,server5=server5:9000:127.0.0.1:5005'

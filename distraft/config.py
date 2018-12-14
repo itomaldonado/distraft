@@ -129,6 +129,11 @@ class Configuration:
         )
         setattr(
             self,
+            'CLIENT_HOST',
+            os.environ.get('DISTRAFT_CLIENT_HOST', '127.0.0.1').strip().lower()
+        )
+        setattr(
+            self,
             'TCP_PORT',
             int(os.environ.get('DISTRAFT_TCP_PORT', '5000'))
         )
@@ -136,9 +141,9 @@ class Configuration:
         # finally, the list of members of the cluster **including itself**
         # (names should be unique)
         # (comma separated) in the following format:
-        # name=<self_host>:<self_udp_port>:<self_tcp_port>,
-        # name=<member_1_host>:<member_1_udp_port>:<member_1_tcp_port>,
-        # name=<member_2_host>:<member_2_udp_port>:<member_2_tcp_port>,
+        # name=<self_peer_host>:<self_udp_port>:<self_client_host>:<self_tcp_port>,
+        # name=<member_1_peer_host>:<member_1_udp_port>:<member_1_client_host>:<member_1_tcp_port>,
+        # name=<member_2_peer_host>:<member_2_udp_port>:<member_1_client_host>:<member_2_tcp_port>,
         # ...
         # name=<member_n_host>:<member_n_udp_port>:<member_n_tcp_port>,
         members = {}
@@ -150,7 +155,7 @@ class Configuration:
             if members.get(name, None):
                 raise Exception(f'duplicate member with name found, name: {name}')
             members.update({
-                f'{name}': (mp[0].strip(), int(mp[1]), int(mp[2]))}
+                f'{name}': (mp[0].strip(), int(mp[1]), mp[2].strip(), int(mp[3]))}
             )
         setattr(self, 'MEMBERS', members)
 

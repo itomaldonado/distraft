@@ -1,10 +1,11 @@
 import asyncio
 import logging
-import urlparse
+import sys
 
 from config import config
 from consensus import Raft
 from quart import Quart, request, jsonify, redirect
+from urllib.parse import urlparse, urlunparse
 
 logger = logging.getLogger(__name__)
 app = Quart(__name__)
@@ -16,7 +17,7 @@ loop = None
 
 def _setup_logging():
     fmt = '[%(asctime)s]: %(levelname)s %(message)s'
-    logging.basicConfig(format=fmt, level=config.LOG_LEVEL)
+    logging.basicConfig(format=fmt, level=config.LOG_LEVEL, stream=sys.stdout)
 
 
 def _setup_consensus_networking():
@@ -29,6 +30,7 @@ def _setup_consensus_networking():
     raft = Raft(
         node_id=config.NAME,
         host=config.HOST,
+        client_host=config.CLIENT_HOST,
         udp_port=config.UDP_PORT,
         tcp_port=config.TCP_PORT,
         members=config.MEMBERS,
@@ -55,18 +57,13 @@ def is_leader():
         return False
 
 
-@app.route("/", methods=['GET'])
-async def root():
-    global raft
-    return jsonify({'ok': True, 'raft_status': f'{raft.up}'}), 200
-
-
 @app.route('/<key>', methods=['POST'])
 async def set_value(key=None):
     global raft
+    form = await request.form
+    logger.debug(f'{raft.id} post message received, set "{key}" -> "{form}".')
     if is_leader():
         try:
-            form = await request.form
             if (key and key.strip()) and (form['value'] and form['value'].strip()):
                 k = key.strip()
                 v = form['value'].strip()
@@ -79,12 +76,11 @@ async def set_value(key=None):
             return jsonify({'ok': False, 'error': f'system error: {str(err)}'}), 503
     else:
         # not the leader, redirect **if posible**
-        leader = get_leader()
-        if leader:
-            leader_info = config.MANAGERS[leader]
-            parsed = urlparse.urlparse(request.url)
-            replaced = parsed._replace(netloc=f'{leader_info[0]}:{leader_info[2]}')
-            return redirect(urlparse.urlunparse(replaced), code=302)
+        leader_address = raft.leader_client_address
+        if leader_address:
+            parsed = urlparse(request.url)
+            replaced = parsed._replace(netloc=leader_address)
+            return redirect(urlunparse(replaced), status_code=307)
         else:  # if no leader, error out...
             return jsonify({'ok': False, "error": 'no leader'}), 503
 
@@ -105,17 +101,16 @@ async def get_value(key=None):
             return jsonify({'ok': False, 'error': f'{str(err)}'}), 503
     else:
         # not the leader, redirect **if posible**
-        leader = get_leader()
-        if leader:
-            leader_info = config.MANAGERS[leader]
-            parsed = urlparse.urlparse(request.url)
-            replaced = parsed._replace(netloc=f'{leader_info[0]}:{leader_info[2]}')
-            return redirect(urlparse.urlunparse(replaced), code=302)
+        leader_address = raft.leader_client_address
+        if leader_address:
+            parsed = urlparse(request.url)
+            replaced = parsed._replace(netloc=leader_address)
+            return redirect(urlunparse(replaced))
         else:  # if no leader, error out...
             return jsonify({'ok': False, "error": 'no leader'}), 503
 
 
-@app.route('/status', methods=['GET'])
+@app.route('/', methods=['GET'])
 async def get_server_status(key=None):
     global raft
     status = {}
@@ -123,6 +118,7 @@ async def get_server_status(key=None):
         {
             'id': raft.id,
             'leader': raft.leader,
+            'is_leader': (raft.leader == raft.id),
             'state': raft.state.name,
             'up': raft.up,
             'commit_index': raft.log.commit_index,
@@ -151,7 +147,7 @@ async def stop():
 
 
 @app.route("/start")
-async def stop():
+async def start():
     global raft
     logger.info(f'{raft.id} starting up the raft server.')
 
@@ -167,4 +163,4 @@ if __name__ == '__main__':
     _setup_consensus_networking()
 
     app.config['JSONIFY_PRETTYPRINT_REGULAR'] = config.PRETTY_PRINT_RESPONSES
-    app.run(host='127.0.0.1', port=5000, debug=config.WEB_SERVER_DEBUG)
+    app.run(host=config.CLIENT_HOST, port=config.TCP_PORT, debug=config.WEB_SERVER_DEBUG)

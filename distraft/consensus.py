@@ -3,6 +3,7 @@ import functools
 import logging
 import os
 import random
+import socket
 
 from config import config
 from enum import Enum
@@ -771,7 +772,13 @@ class Leader(State):
 
 class Raft:
 
-    def __init__(self, node_id=None, host=None, udp_port=None, tcp_port=None, loop=None, members=None):
+    def __init__(
+            self,
+            node_id=None,
+            members=None,
+            host=None, udp_port=None,
+            client_host=None, tcp_port=None,
+            loop=None):
         """Creates a Raft consensus server to be used however needed
 
         args:
@@ -781,15 +788,16 @@ class Raft:
             - loop: asyncio loop object
             - members: dictionary of members, like:
                 {
-                    'server0': ('127.0.0.1', 9000, 5000),
-                    'server1': ('127.0.0.1', 9001, 5001),
-                    'server2': ('127.0.0.1', 9002, 5002),
+                    'server0': ('127.0.0.1', 9000, '127.0.0.1', 5000),
+                    'server1': ('127.0.0.1', 9001, '127.0.0.1', 5001),
+                    'server2': ('127.0.0.1', 9002, '127.0.0.1', 5002),
                 }
             - members list **includes** local node
         """
         self.id = node_id
         self.host = host
         self.udp_port = udp_port
+        self.client_host = client_host
         self.tcp_port = tcp_port
         self.loop = loop if loop else asyncio.get_event_loop()
         self.queue = asyncio.Queue(loop=self.loop)
@@ -826,7 +834,9 @@ class Raft:
         handler(data)
 
     async def start(self):
-        logger.info(f'{self.id} starting raft server with info: {self.host}:{self.udp_port}:{self.tcp_port}')
+        logger.info(
+            f'{self.id} starting raft server with info: {self.host}:{self.udp_port}:{self.tcp_port}'
+        )
         protocol = PeerProtocol(
             network_queue=self.queue,
             network_request_handler=self.network_request_handler,
@@ -854,6 +864,7 @@ class Raft:
             data — serializable object
             destination — tuple (host, port), example: (127.0.0.1, 8000)
         """
+        dest_host = socket.gethostbyname(dest_host)
         destination = (dest_host, dest_port,)
         logger.debug(f'{self.id} sending message to {destination}, data: {data}.')
         await self.queue.put({'data': data, 'destination': destination})
@@ -879,6 +890,14 @@ class Raft:
     def leader_address(self):
         if self.leader:
             return self.members.get(self.leader, None)
+        else:
+            return None
+
+    @property
+    def leader_client_address(self):
+        full_tuple = self.leader_address
+        if full_tuple:
+            return f'{full_tuple[2]}:{full_tuple[3]}'
         else:
             return None
 
