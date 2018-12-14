@@ -4,11 +4,9 @@ import logging
 import msgpack
 import collections
 
-logger = logging.getLogger(__name__)
+from config import config
 
-# Config:
-UPDATE_CACHE_COUNTER = 5
-SERIALIZER = False
+logger = logging.getLogger(__name__)
 
 
 class PersistentDict(collections.UserDict):
@@ -20,9 +18,6 @@ class PersistentDict(collections.UserDict):
         # create file's directory structure if it doesn't exist
         os.makedirs(os.path.dirname(self.filename), exist_ok=True)
 
-        # open log in 'append' mode
-        open(self.filename, 'a').close()
-
         if reset and os.path.isfile(self.filename):
             # remove old log
             os.remove(self.filename)
@@ -30,6 +25,10 @@ class PersistentDict(collections.UserDict):
             with open(self.filename, 'a') as f:
                 f.writelines(['{}'])
             logger.debug('Reseting persistent dictionary.')
+        elif not os.path.isfile(self.filename):
+            # touch/create new empty dict
+            with open(self.filename, 'a') as f:
+                f.writelines(['{}'])
         elif os.path.isfile(self.filename):
             logger.debug('Using existing persistent dictionary.')
 
@@ -67,13 +66,15 @@ class PersistentLog(collections.UserList):
 
     def __init__(self, data=None, node_id=None, log_path=None, reset=False):
 
-        logger.debug('Initializing persistent log')
+        logger.debug(f'{node_id} initializing persistent log.')
 
         # Volatile states (lost after restart)
 
         # ####################
         # #### ANY state #####
         # ####################
+
+        self.id = node_id
 
         # index of highest log entry known to be committed
         # (initialized to 0, increases monotonically)"""
@@ -115,9 +116,9 @@ class PersistentLog(collections.UserList):
             os.remove(self.filename)
             # touch/create new empty log
             open(self.filename, 'a').close()
-            logger.debug('Reseting persistent log.')
+            logger.debug(f'{self.id} reseting persistent log.')
         elif os.path.isfile(self.filename):
-            logger.debug('Using existing persistent log.')
+            logger.debug(f'{self.id} using existing persistent log.')
 
         # load the data from file
         data = data if data else {}
@@ -130,8 +131,10 @@ class PersistentLog(collections.UserList):
         # super().__init__(data)
 
     def __getitem__(self, index):
-        logger.debug(f'Get log entry at: {index}')
-        return self.cache[index - 1]
+        logger.debug(f'{self.id} get persistent log entry at: {index}')
+        return_val = self.cache[index - 1]
+        logger.debug(f'{self.id} log entry at: {index} is {return_val}')
+        return return_val
 
     def __bool__(self):
         return bool(self.cache)
@@ -140,13 +143,13 @@ class PersistentLog(collections.UserList):
         return len(self.cache)
 
     def __pack(self, data):
-        if SERIALIZER:
+        if config.SERIALIZER in ['msgpack']:
             return msgpack.packb(data, use_bin_type=True)
         else:
             return json.dumps(data).encode()
 
     def __unpack(self, data):
-        if SERIALIZER:
+        if config.SERIALIZER in ['msgpack']:
             # TODO: find out how to unpack multi-line messages
             return msgpack.unpackb(data, use_list=True, encoding='utf-8')
         else:
@@ -154,7 +157,7 @@ class PersistentLog(collections.UserList):
             return json.loads(decoded)
 
     def write(self, term, command):
-        logger.debug(f'Write entry "{command}"" at: {len(self.cache)}')
+        logger.debug(f'{self.id} write persistent log entry "{command}" at: {len(self.cache)}')
         with open(self.filename, 'ab') as log_file:
             entry = {'term': term, 'command': command}
             log_file.write(self.__pack(entry) + '\n'.encode())
@@ -169,8 +172,8 @@ class PersistentLog(collections.UserList):
             return [self.__unpack(entry) for entry in f.readlines()]
 
     def delete_from(self, index):
-        # updated = self.cache[:index - 1]
-        updated = self.cache[:index]
+        logger.debug(f'{self.id} delete persistent log entries from: {index}.')
+        updated = self.cache[:index - 1]
         open(self.filename, 'wb').close()
         self.cache = []
         for entry in updated:
@@ -179,23 +182,26 @@ class PersistentLog(collections.UserList):
     @property
     def last_log_index(self):
         """Index of last log entry staring from 1"""
-        return (len(self.cache))
+        last_log_index = len(self.cache)
+        logger.debug(f'{self.id} last_log_index at: {last_log_index}.')
+        return (last_log_index)
 
     @property
     def last_log_term(self):
-        if self.cache:
-            return self.cache[-1]['term']
-        return 0
+        last_log_term = self.cache[-1]['term'] if self.cache else 0
+        logger.debug(f'{self.id} last_log_term at: {last_log_term}.')
+        return last_log_term
 
 
 class PersistentStateMachine(PersistentDict):
     """Raft Replicated State Machine — a persistent dictionary"""
 
     def __init__(self, node_id=None, path=None, reset=False):
-        self.node_id = node_id
-        self.data_filename = os.path.join(path, f'{self.node_id.replace(":", "_")}.data')
+        self.id = node_id
+        self.data_filename = os.path.join(path, f'{self.id.replace(":", "_")}.data')
         super().__init__(path=self.data_filename, reset=reset)
 
     def commit(self, command):
         """Commit a command to State Machine"""
+        logger.debug(f'{self.id} commit command: {command}.')
         self.update(command)

@@ -4,6 +4,7 @@ import logging
 import os
 import random
 
+from config import config
 from enum import Enum
 from networking import PeerProtocol
 from storage import PersistentLog, PersistentDict, PersistentStateMachine
@@ -11,16 +12,6 @@ from timers import EventTimer
 from uuid import uuid1
 
 logger = logging.getLogger(__name__)
-
-# Configuration:
-RESET_LOGS = True
-TIME_TO_RUN = 25
-LOG_PATH = '/Users/itomaldonado/git/distraft/logs'
-PERSISTENT_PATH = '/Users/itomaldonado/git/distraft/logs/'
-HEARTBEAT_TIMEOUT_LOWER = 0.100
-MISSED_HEARTBEATS = 5
-ELECTION_TIMEOUT_LOWER = 0.500
-TIMEOUT_SPREAD_RATIO = 2.0
 
 
 def generate_request_id():
@@ -31,21 +22,11 @@ def generate_request_id():
     return str(uuid1())
 
 
-def validate_commit_index(fun):
-        """Apply to the State Machine everything up to commit index"""
-        @functools.wraps(fun)
-        def wrapped(self, *args, **kwargs):
-            for not_applied in range(self.log.last_applied + 1, self.log.commit_index + 1):
-                self.state_machine.commit(self.log[not_applied]['command'])
-                self.log.last_applied += 1
-
-                try:
-                    self.raft.apply_future.set_result(not_applied)
-                except (asyncio.futures.InvalidStateError, AttributeError):
-                    pass
-
-            return fun(self, *args, **kwargs)
-        return wrapped
+class States(Enum):
+    """Enumerate the states a node can take"""
+    FOLLOWER = 0
+    CANDIDATE = 1
+    LEADER = 3
 
 
 def validate_term(fun):
@@ -55,13 +36,22 @@ def validate_term(fun):
         update current local (node's) term and become a follower
     - if request (sender's) term is older:
         respond with {'success': False}
+
+    args:
+        - data object received from other members
+
+    returns:
+        - True if term validation succeeds, False otherwise
     """
     @functools.wraps(fun)
     def wrapped(self, data):
+        logger.debug(f'{self.id} validate_term() start.')
         if self.storage['term'] < data['term']:
             self.storage.update({'term': data['term']})
             if not isinstance(self, Follower):
                 self.to_follower()
+                logger.debug(f'{self.id} validate_term() done, bad term, moved to Follower.')
+                return False
 
         if self.storage['term'] > data['term'] and not data['type'].endswith('_response'):
             response = {
@@ -69,33 +59,37 @@ def validate_term(fun):
                 'term': self.storage['term'],
                 'type': f'{data["type"]}_response',
             }
-            host = data['sender'][0]
-            port = data['sender'][1]
+            sender = self.raft.members.get(data['sender_id'])
+            host = sender[0]
+            port = sender[1]
             asyncio.ensure_future(
                 self.raft.send(data=response, dest_host=host, dest_port=port), loop=self.loop
             )
-            return
+            logger.debug(f'{self.id} validate_term() done, bad term, responded with False.')
+            return False
 
+        logger.debug(f'{self.id} validate_term() done, good term.')
         return fun(self, data)
     return wrapped
 
 
-def atomic(func):
+def validate_commit_index(func):
+    """Apply to State Machine everything up to commit index"""
 
     @functools.wraps(func)
-    async def wrapped(self, *args, **kwargs):
-        with await self.lock:
-            result = await func(self, *args, **kwargs)
+    def wrapped(self, *args, **kwargs):
+        logger.debug(f'{self.id} validate_commit_index() start.')
+        for not_applied in range(self.log.last_applied + 1, self.log.commit_index + 1):
+            self.state_machine.commit(self.log[not_applied]['command'])
+            self.log.last_applied += 1
 
-        return result
+            try:
+                self.apply_future.set_result(not_applied)
+            except (asyncio.futures.InvalidStateError, AttributeError):
+                pass
+        logger.debug(f'{self.id} validate_commit_index() done.')
+        return func(self, *args, **kwargs)
     return wrapped
-
-
-class States(Enum):
-    """Enumerate the states a node can take"""
-    FOLLOWER = 0
-    CANDIDATE = 1
-    LEADER = 3
 
 
 class State:
@@ -128,7 +122,8 @@ class State:
         {
             'type': 'request_vote',
             'term': 5,
-            'candidate_id': '127.0.0.1:9000:9000',
+            'candidate_id': 'server0',
+            'sender_id': 'server0',
             'last_log_index': 10,
             'last_log_term': 4
         }
@@ -143,7 +138,7 @@ class State:
             'type': 'request_vote_response',
             'term': 5,
             'vote_granted': True,
-            'sender_id': <local node id>
+            'sender_id': 'server0'
         }
         """
 
@@ -171,7 +166,8 @@ class State:
         {
             'type': 'append_entries',
             'term': 5,
-            'leader_id': '127.0.0.1:9000:9000',
+            'leader_id': 'server0',
+            'sender_id': 'server0',
             'commit_index': 10,
             'request_id': self.request_id,
             'entries': [],
@@ -196,7 +192,7 @@ class State:
             'type': 'append_entries_response',
             'term': 5,
             'success': True,
-            'sender_id': <local node id>
+            'sender_id': 'server0'
         }
         """
 
@@ -215,52 +211,6 @@ class State:
     def to_leader(self):
         self.raft.to_state(States.LEADER)
 
-    def validate_term(self, data):
-        """Compares current local (node's) term and request (sender's) term:
-
-        - if current local (node's) term is older:
-            update current local (node's) term and become a follower
-        - if request (sender's) term is older:
-            respond with {'success': False}
-
-        args:
-            - data object received from other members
-
-        returns:
-            - True if term validation succeeds, False otherwise
-        """
-        if self.storage['term'] < data['term']:
-            self.storage.update({'term': data['term']})
-            if not isinstance(self, Follower):
-                self.to_follower()
-                return False
-
-        if self.storage['term'] > data['term'] and not data['type'].endswith('_response'):
-            response = {
-                'success': False,
-                'term': self.storage['term'],
-                'type': f'{data["type"]}_response',
-            }
-            host = data['sender'][0]
-            port = data['sender'][1]
-            asyncio.ensure_future(
-                self.raft.send(data=response, dest_host=host, dest_port=port), loop=self.loop
-            )
-            return False
-
-        return True
-
-    def commit_state_to_commit_index(self):
-        """Commit to the State Machine everything up to commit index"""
-        for not_applied in range(self.log.last_applied + 1, self.log.commit_index + 1):
-            self.state_machine.commit(self.log[not_applied]['command'])
-            self.log.last_applied += 1
-
-            try:
-                self.raft.apply_future.set_result(not_applied)
-            except (asyncio.futures.InvalidStateError, AttributeError):
-                pass
-
     @property
     def name(self):
         return "Base"
@@ -268,29 +218,26 @@ class State:
     @staticmethod
     def generate_election_timeout():
         to = random.uniform(
-            float(ELECTION_TIMEOUT_LOWER),
-            float(TIMEOUT_SPREAD_RATIO*ELECTION_TIMEOUT_LOWER)
+            float(config.ELECTION_TIMEOUT),
+            float(config.TIMEOUT_SPREAD_RATIO*config.ELECTION_TIMEOUT)
         )
-        logger.debug(f'Generating an eleciton timeout of: {to} seconds.')
         return to
 
     @staticmethod
     def generate_heartbeat_timeout():
         to = random.uniform(
-            float(HEARTBEAT_TIMEOUT_LOWER),
-            float(TIMEOUT_SPREAD_RATIO*HEARTBEAT_TIMEOUT_LOWER)
+            float(config.HEARTBEAT_TIMEOUT),
+            float(config.TIMEOUT_SPREAD_RATIO*config.HEARTBEAT_TIMEOUT)
         )
-        logger.debug(f'Generating a heartbeat timeout of: {to} seconds.')
         return to
 
     @staticmethod
     def generate_stepdown_timeout():
-        lower = HEARTBEAT_TIMEOUT_LOWER*MISSED_HEARTBEATS
+        lower = config.HEARTBEAT_TIMEOUT*config.MISSED_HEARTBEATS
         to = random.uniform(
             float(lower),
-            float(TIMEOUT_SPREAD_RATIO*lower)
+            float(config.TIMEOUT_SPREAD_RATIO*lower)
         )
-        logger.debug(f'Generating a heartbeat timeout of: {to} seconds.')
         return to
 
 
@@ -304,15 +251,16 @@ class Follower(State):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.lock = asyncio.Lock()
         self.election_timer = EventTimer(Follower.generate_election_timeout, self.to_candidate)
 
     def start(self):
+        logger.info(f'{self.id} became a Folllower.')
         # (always) set voted_for to None
         self.storage.update({'voted_for': None})
 
         # (if unexistent) set term to zero"""
         if not self.storage.get('term', None):
+            logger.debug(f'{self.id} term not found in storage, reseting to 0.')
             self.storage.update({'term': 0})
 
         # start election timer
@@ -322,6 +270,8 @@ class Follower(State):
         # stop the election timer
         self.election_timer.stop()
 
+    @validate_commit_index
+    @validate_term
     def handle_append_entries(self, data):
         """Handle an AppendEntries RPC, details:
 
@@ -337,12 +287,10 @@ class Follower(State):
             - update indexes if necessary
             - respond with success: True
         """
-        # apply to state machine and validate term
-        self.commit_state_to_commit_index()
-        if not self.validate_term(data):
-            return
+        logger.debug(f'{self.id} handle_append_entries(), data: {data}')
 
         success, response = self._check_and_append_log_entriex(data)
+
         if success:
             logger.debug(
                 f'{self.id} appended entries from {data["leader_id"]} '
@@ -354,17 +302,17 @@ class Follower(State):
                 f'leader\'s {data["prev_log_index"]}, entries: {data["entries"]}'
             )
 
-            # send response to sender
-            host = data['sender'][0]
-            port = data['sender'][1]
-            asyncio.ensure_future(
-                self.raft.send(data=response, dest_host=host, dest_port=port), loop=self.loop
-            )
+        # send response to sender
+        sender = self.raft.members.get(data['sender_id'])
+        host = sender[0]
+        port = sender[1]
+        asyncio.ensure_future(
+            self.raft.send(data=response, dest_host=host, dest_port=port), loop=self.loop
+        )
 
-            # since we got a message, reset the election timer
-            self.election_timer.reset()
+        # since we got a message, reset the election timer
+        self.election_timer.reset()
 
-    @atomic
     def _check_and_append_log_entriex(self, data):
         """Validates log entries and appends if necesary
         args:
@@ -379,16 +327,15 @@ class Follower(State):
         try:
             # checks for success (assume false first)
             prev_log_index = data['prev_log_index']
-            success = False
-
-            if prev_log_index <= self.log.last_log_index:
-                success = True
-
-            if self.log[prev_log_index]['term'] == data['prev_log_term']:
-                success = True
 
             # if validation failed, return False
-            if not success:
+            logger.debug(
+                f'{self.id} check indexes/terms: ' +
+                f'{prev_log_index} > {self.log.last_log_index} or ' +
+                f'{self.log[prev_log_index]["term"]} != {data["prev_log_term"]}'
+            )
+            if ((prev_log_index > self.log.last_log_index) or
+               (self.log[prev_log_index]['term'] != data['prev_log_term'])):
                 response = {
                     'type': 'append_entries_response',
                     'term': self.storage['term'],
@@ -397,24 +344,64 @@ class Follower(State):
                     'sender_id': self.id
                 }
                 return False, response
+
         except IndexError:
+            logger.debug(
+                f'{self.id} check went out of bounds, possibly because it is the first append'
+            )
             pass
 
         # if term is valid and append_entries comes, set leader to the ID
+        logger.debug(f'{self.id} setting leader to {data["leader_id"]}')
         self.raft.set_leader(data['leader_id'])
+
+        # If the new entry happens to be a duplicate (same index same term),
+        # we don't do anything and respond with 'SUCCESS'
+        new_index = data['prev_log_index'] + 1
+        try:
+            logger.debug(
+                f'{self.id} check if we need to do nothing: ' +
+                f'{self.log[new_index]["term"]} == {data["term"]}'
+            )
+            if self.log[new_index]['term'] == data['term']:
+                # Respond True since there was an entry matching already matching
+                # prev_log_index and prev_log_term found
+                response = {
+                    'type': 'append_entries_response',
+                    'term': self.storage['term'],
+                    'success': True,
+                    'last_log_index': self.log.last_log_index,
+                    'request_id': data['request_id'],
+                    'sender_id': self.id
+                }
+                return True, response
+        except IndexError:
+            logger.debug(
+                f'{self.id} check went out of bounds, possibly because it is the first append'
+            )
+            pass
 
         # If an existing entry conflicts with a new one (same index but different terms),
         # delete the existing entry and all that follow it
         new_index = data['prev_log_index'] + 1
         try:
+            logger.debug(
+                f'{self.id} check if we need to delete: ' +
+                f'{self.log[new_index]["term"]} != {data["term"]} or ' +
+                f'{self.log.last_log_index} != {prev_log_index}'
+            )
             if self.log[new_index]['term'] != data['term'] or (
                 self.log.last_log_index != prev_log_index
             ):
                 self.log.delete_from(new_index)
         except IndexError:
+            logger.debug(
+                f'{self.id} check went out of bounds, possibly because it is the first append'
+            )
             pass
 
         # write all entries received in the message to local (node's) log, in order
+        logger.debug(f'{self.id} appending entries from "append_entries" message')
         for entry in data['entries']:
             self.log.write(entry['term'], entry['command'])
 
@@ -434,6 +421,7 @@ class Follower(State):
         }
         return True, response
 
+    @validate_term
     def handle_request_vote(self, data):
         """Handle a RequestVote RPC, details:
 
@@ -443,10 +431,7 @@ class Follower(State):
             - last entries with different terms, then the log with the later term is more up-to-date
             - logs that end with the same term, then whichever log is longer is more up-to-date
         """
-
-        # validate term
-        if not self.validate_term(data):
-            return
+        logger.debug(f'{self.id} handle_request_vote(), data: {data}')
 
         # If you have voted for this term, don't vote again~
         if self.storage.get('voted_for', None) is None:
@@ -472,8 +457,9 @@ class Follower(State):
                 self.storage.update({'voted_for': data['candidate_id']})
 
             # send response to sender
-            host = data['sender'][0]
-            port = data['sender'][1]
+            sender = self.raft.members.get(data['sender_id'])
+            host = sender[0]
+            port = sender[1]
             asyncio.ensure_future(
                 self.raft.send(data=response, dest_host=host, dest_port=port), loop=self.loop
             )
@@ -502,12 +488,17 @@ class Candidate(State):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.election_timer = EventTimer(self.generate_election_timeout, self.to_follower)
+        self.election_timer = EventTimer(self.generate_election_timeout, self.election_timedout)
         self.voting_timer = EventTimer(self.generate_heartbeat_timeout, self.request_vote)
         self.vote_count = 0
 
+    def election_timedout(self):
+        logger.info(f'{self.id} Candidate election timed out, becoming follower.')
+        self.to_follower()
+
     def start(self):
         """Increment current term, vote for herself & send vote requests"""
+        logger.info(f'{self.id} became a candidate for term {self.storage["term"] + 1}.')
         self.storage.update({
             'term': self.storage['term'] + 1,
             'voted_for': self.id
@@ -523,32 +514,41 @@ class Candidate(State):
 
     def request_vote(self):
         """Send message of type request_vote (RequestVote RPC): gather votes form nodes"""
+        logger.info(f'{self.id} Candidate requesting votes from members.')
         data = {
             'type': 'request_vote',
             'term': self.storage['term'],
             'candidate_id': self.id,
+            'sender_id': self.id,
             'last_log_index': self.log.last_log_index,
             'last_log_term': self.log.last_log_term
         }
         self.raft.broadcast(data)
 
+    @validate_term
     def handle_request_vote_response(self, data):
         """Handle responses from a RequestVote RPC, details:
 
         - if the remote node voted for this (local) node/candidate, add to count.
         - check for majority, if we got it, transition to leader
         """
-
-        # validate term
-        if not self.validate_term(data):
-            return
+        logger.debug(f'{self.id} handle_request_vote_response(), data: {data}')
 
         if data.get('vote_granted'):
             self.vote_count += 1
 
             if self.raft.is_majority(self.vote_count):
+                logger.info(
+                    f'{self.id} Candidate has enough votes '
+                    f'({self.vote_count}), changing state to leader'
+                )
                 self.to_leader()
+            else:
+                logger.info(
+                    f'{self.id} Candidate does not have enough votes yet, votes: {self.vote_count}'
+                )
 
+    @validate_term
     def handle_request_vote(self, data):
         """Handle a RequestVote RPC, details:
 
@@ -558,21 +558,17 @@ class Candidate(State):
             - last entries with different terms, then the log with the later term is more up-to-date
             - logs that end with the same term, then whichever log is longer is more up-to-date
         """
+        logger.debug(f'{self.id} handle_request_vote(), data: {data}')
+        pass
 
-        # validate term (if a higher term, just become a follower...)
-        if not self.validate_term(data):
-            return
-
+    @validate_term
     def handle_append_entries(self, data):
         """Handle an AppendEntries RPC, details:
 
         - if the message is from a leader with equal (or greater) term number, step down:
             (become follower)
         """
-
-        # validate term
-        if not self.validate_term(data):
-            return
+        logger.debug(f'{self.id} handle_append_entries(), data: {data}')
 
         if self.storage['term'] >= data['term']:
             self.to_follower()
@@ -620,6 +616,7 @@ class Leader(State):
         self.response_map = {}
 
     def start(self):
+        logger.info(f'{self.id} became a Leader for term {self.storage["term"]}.')
         self.init_log()
         self.heartbeat()
         self.heartbeat_timer.start()
@@ -634,35 +631,45 @@ class Leader(State):
         # self.stepdown_timer.stop()
 
     def init_log(self):
-        self.log.next_index = {
-            follower: self.log.last_log_index + 1 for follower in self.raft.members
-        }
+        self.log.next_index = {}
+        for follower in self.raft.members:
+            if follower != self.id:
+                self.log.next_index.update({follower: self.log.last_log_index + 1})
 
-        self.log.match_index = {
-            follower: 0 for follower in self.raft.members
-        }
+        self.log.match_index = {}
+        for follower in self.raft.members:
+            if follower != self.id:
+                self.log.match_index.update({follower: 0})
 
-    async def append_entries(self, destination=None):
+    async def append_entries(self, destination_id=None, reset_timer=False):
         """Handle an AppendEntries RPC to replicate log entries and handle heartbeats:
 
         args:
             destination:
-                - (host, udp_port, tcp_port) if sending to a specific member/node
+                - destination_id if sending to a specific member/node
                 - None otherwise (default), will broadcast RPC
 
         Notes:
             - if the local (node's) next_index of the remote (node)
         """
-        destinations = [destination] if destination else [m for k, m in self.raft.members.items()]
-        logger.debug(f'sending append_entries RPC to {len(destinations)} members')
+        if destination_id:
+            destinations = [{'id': destination_id, 'address': self.members[destination_id]}]
+        else:
+            destinations = []
+            for k, v in self.raft.members.items():
+                if k != self.id:
+                    destinations.append({'id': k, 'address': v})
+        logger.debug(f'{self.id} sending append_entries RPC to {len(destinations)} members')
 
-        for d in destinations:
-            d_id = f'{d[0]}:{d[1]}:{d[2]}'
-            logger.debug(f'sending to member: {d_id}')
+        for dest in destinations:
+            d_id = dest['id']
+            d = dest['address']
+            logger.debug(f'{self.id} sending to member: {d_id}')
             data = {
                 'type': 'append_entries',
                 'term': self.storage['term'],
                 'leader_id': self.id,
+                'sender_id': self.id,
                 'commit_index': self.log.commit_index,
                 'request_id': self.request_id
             }
@@ -681,17 +688,17 @@ class Leader(State):
                 'prev_log_term': self.log[prev_index]['term'] if self.log and prev_index else 0
             })
 
-            logger.debug(f'Sending message {self.id} --> {d_id}, data: {data}')
+            logger.debug(f'{self.id} Sending message to {d_id}, data: {data}')
             asyncio.ensure_future(
                 self.raft.send(data=data, dest_host=d[0], dest_port=d[1]), loop=self.loop
             )
+        if reset_timer:
+            self.heartbeat_timer.reset()
 
+    @validate_commit_index
+    @validate_term
     def handle_append_entries_response(self, data):
-
-        # apply to state machine and validate term
-        self.commit_state_to_commit_index()
-        if not self.validate_term(data):
-            return
+        logger.debug(f'{self.id} handle_append_entries_response(), data: {data}')
 
         sender_id = data['sender_id']
 
@@ -706,20 +713,31 @@ class Leader(State):
                 # self.step_down_timer.reset()
                 del self.response_map[data['request_id']]
 
-        if not data['success']:
-            self.log.next_index[sender_id] = max(self.log.next_index[sender_id] - 1, 1)
-
-        else:
+        if data['success']:
             self.log.next_index[sender_id] = data['last_log_index'] + 1
             self.log.match_index[sender_id] = data['last_log_index']
-
             self.update_commit_index()
+            try:
+                self.raft.apply_future.set_result(self.log.last_applied)
+            except (asyncio.futures.InvalidStateError, AttributeError):
+                pass
+        else:
+            self.log.next_index[sender_id] = max(self.log.next_index[sender_id] - 1, 1)
 
         # Send AppendEntries RPC to continue updating fast-forward log (data['success'] == False)
         # or in case there are new entries to sync (data['success'] == data['updated'] == True)
         if self.log.last_log_index >= self.log.next_index[sender_id]:
-            sender_info = self.raft.members[sender_id]
-            asyncio.ensure_future(self.append_entries(destination=sender_info), loop=self.loop)
+            asyncio.ensure_future(self.append_entries(destination=sender_id), loop=self.loop)
+
+    @validate_term
+    def handle_append_entries(self, data):
+        """Handle an AppendEntries RPC, details:
+
+        - if the message is from a leader with equal (or greater) term number, step down:
+            (become follower)
+        """
+        logger.debug(f'{self.id} handle_append_entries(), data: {data}')
+        pass
 
     def update_commit_index(self):
         commited_on_majority = 0
@@ -753,26 +771,26 @@ class Leader(State):
 
 class Raft:
 
-    def __init__(self, host=None, udp_port=None, tcp_port=None, loop=None, members=None):
+    def __init__(self, node_id=None, host=None, udp_port=None, tcp_port=None, loop=None, members=None):
         """Creates a Raft consensus server to be used however needed
 
         args:
+            - node_id: the id of this node
             - host: hostname / IP for this server
             - host: port number for this server
             - loop: asyncio loop object
-            - members: list of members dicrionary, like:
-                [
-                    ('127.0.0.1', 8000, 8000),
-                    ('127.0.0.1', 8001, 8001),
-                    ('127.0.0.1', 8002, 8002),
-                    ...
-                ]
-            - members list does not include local node
+            - members: dictionary of members, like:
+                {
+                    'server0': ('127.0.0.1', 9000, 5000),
+                    'server1': ('127.0.0.1', 9001, 5001),
+                    'server2': ('127.0.0.1', 9002, 5002),
+                }
+            - members list **includes** local node
         """
-        self.host = host if host else '127.0.0.1'
-        self.udp_port = udp_port if udp_port else 8000
-        self.tcp_port = tcp_port if tcp_port else 8000
-        self.id = f'{self.host}:{self.udp_port}:{self.tcp_port}'
+        self.id = node_id
+        self.host = host
+        self.udp_port = udp_port
+        self.tcp_port = tcp_port
         self.loop = loop if loop else asyncio.get_event_loop()
         self.queue = asyncio.Queue(loop=self.loop)
         self._leader = None
@@ -781,21 +799,19 @@ class Raft:
         self.up = False
 
         # cluster list
-        self.members = {}
-        for m in members:
-            self.members.update({f'{m[0]}:{m[1]}:{m[2]}': m})
+        self.members = members if members else {}
         logger.debug(f'{self.id} has these members: {self.members}')
 
         # Initialize logs and persitent data
         self.state_machine = PersistentStateMachine(
-            node_id=self.id, path=PERSISTENT_PATH,
-            reset=RESET_LOGS
+            node_id=self.id, path=config.DATA_PATH,
+            reset=config.RESET_LOGS
         )
         self.state_storage = PersistentDict(
-            path=os.path.join(PERSISTENT_PATH, f'{self.id}.state'),
-            reset=RESET_LOGS
+            path=os.path.join(config.DATA_PATH, f'{self.id}.state'),
+            reset=config.RESET_LOGS
         )
-        self.log = PersistentLog(node_id=self.id, log_path=LOG_PATH, reset=RESET_LOGS)
+        self.log = PersistentLog(node_id=self.id, log_path=config.LOG_PATH, reset=config.RESET_LOGS)
 
     def network_request_handler(self, data):
         logger.debug(f'{self.id} received message of type: {data["type"]} from {data["sender"]}')
@@ -810,7 +826,7 @@ class Raft:
         handler(data)
 
     async def start(self):
-        logger.info(f'Starting raft server {self.id}')
+        logger.info(f'{self.id} starting raft server with info: {self.host}:{self.udp_port}:{self.tcp_port}')
         protocol = PeerProtocol(
             network_queue=self.queue,
             network_request_handler=self.network_request_handler,
@@ -827,7 +843,7 @@ class Raft:
         self.up = True
 
     def stop(self):
-        logger.info(f'Stopping raft server {self.id}')
+        logger.info(f'{self.id} stopping raft server')
         self.state.stop()
         self.transport.close()
         self.up = False
@@ -838,18 +854,22 @@ class Raft:
             data — serializable object
             destination — tuple (host, port), example: (127.0.0.1, 8000)
         """
-        await self.queue.put({'data': data, 'destination': (dest_host, dest_port,)})
+        destination = (dest_host, dest_port,)
+        logger.debug(f'{self.id} sending message to {destination}, data: {data}.')
+        await self.queue.put({'data': data, 'destination': destination})
 
     def broadcast(self, data):
         """Sends data to all Members in cluster
 
         Note: self.members list does not include the local node's info
         """
-        for m in self.members.values():
-            asyncio.ensure_future(
-                self.send(data=data, dest_host=m[0], dest_port=m[1]),
-                loop=self.loop
-            )
+        for k, m in self.members.items():
+            # send messages to everyone **but** yourself
+            if k != self.id:
+                asyncio.ensure_future(
+                    self.send(data=data, dest_host=m[0], dest_port=m[1]),
+                    loop=self.loop
+                )
 
     @property
     def leader(self):
@@ -858,10 +878,7 @@ class Raft:
     @property
     def leader_address(self):
         if self.leader:
-            if self.leader == self.id:
-                return (self.host, self.udp_port, self.tcp_port)
-            else:
-                return self.members[self.leader]
+            return self.members.get(self.leader, None)
         else:
             return None
 
@@ -897,7 +914,7 @@ class Raft:
         """Write to log & send AppendEntries RPC"""
         self.apply_future = asyncio.Future(loop=self.loop)
         self.__write_log(self.state_storage['term'], command)
-        asyncio.ensure_future(self.state.append_entries(), loop=self.loop)
+        asyncio.ensure_future(self.state.append_entries(reset_timer=True), loop=self.loop)
         await self.apply_future
 
     async def set_value(self, key, value):
