@@ -6,9 +6,11 @@ from config import config
 from consensus import Raft
 from quart import Quart, request, jsonify, redirect
 from urllib.parse import urlparse, urlunparse
+from quart_cors import cors
 
 logger = logging.getLogger(__name__)
 app = Quart(__name__)
+app = cors(app)
 
 # globals
 raft = None
@@ -149,11 +151,12 @@ async def stop():
 @app.route("/start")
 async def start():
     global raft
+    global loop
     logger.info(f'{raft.id} starting up the raft server.')
 
     # start server
     if not raft.up:
-        raft.start()
+        asyncio.ensure_future(raft.start(), loop=loop)
 
     return jsonify({'ok': True}), 200
 

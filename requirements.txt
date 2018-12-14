@@ -1,3 +1,4 @@
 Flask==1.0.2
 Quart==0.6.11
 msgpack==0.5.6
+Quart-CORS==0.1.1
