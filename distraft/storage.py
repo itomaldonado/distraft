@@ -172,7 +172,7 @@ class PersistentLog(collections.UserList):
             return [self.__unpack(entry) for entry in f.readlines()]
 
     def delete_from(self, index):
-        logger.debug(f'{self.id} delete persistent log entries from: {index}.')
+        logger.debug(f'{self.id} delete persistent log entries starting at: {index}.')
         updated = self.cache[:index - 1]
         open(self.filename, 'wb').close()
         self.cache = []

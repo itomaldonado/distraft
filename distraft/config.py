@@ -81,6 +81,13 @@ class Configuration:
             parse_bool(os.environ.get('DISTRAFT_RESET_LOGS', 'False'))
         )
 
+        # maximun number of items (append_entries RPCs) that leaders/followers will maintain
+        setattr(
+            self,
+            'MAX_REQUEST_CACHE_LENGTH',
+            int(os.environ.get('DISTRAFT_MAX_REQUEST_CACHE_LENGTH', '1000'))
+        )
+
         # return nicely-formatted json on http responses
         setattr(
             self,

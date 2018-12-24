@@ -10,6 +10,7 @@ from enum import Enum
 from networking import PeerProtocol
 from storage import PersistentLog, PersistentDict, PersistentStateMachine
 from timers import EventTimer
+from utils import Cache
 from uuid import uuid1
 
 logger = logging.getLogger(__name__)
@@ -253,6 +254,7 @@ class Follower(State):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.election_timer = EventTimer(Follower.generate_election_timeout, self.to_candidate)
+        self.request_map = Cache(config.MAX_REQUEST_CACHE_LENGTH)
 
     def start(self):
         logger.info(f'{self.id} became a Folllower.')
@@ -295,7 +297,7 @@ class Follower(State):
         if success:
             logger.debug(
                 f'{self.id} appended entries from {data["leader_id"]} '
-                f'at: {response["last_log_index"]}'
+                f'at: {response["last_log_index"] - 1}'
             )
         else:
             logger.warning(
@@ -314,6 +316,9 @@ class Follower(State):
         # since we got a message, reset the election timer
         self.election_timer.reset()
 
+        # add response to cache
+        self.request_map[data['request_id']] = {'request': data, 'response': response}
+
     def _check_and_append_log_entriex(self, data):
         """Validates log entries and appends if necesary
         args:
@@ -323,6 +328,15 @@ class Follower(State):
             - True if check/append was sucessful (False otherwise)
             - respnse dictionary to send as response
         """
+
+        # Check if request was received, if so, send cached response
+        cached = self.request_map.get(data['request_id'], None)
+        logger.debug(f'{self.id} check if request was cached: {cached}')
+        if cached:
+            response = cached['response']
+            logger.debug(f'{self.id} previous request cached, sending cached response.')
+            return response['success'], response
+
         # Reply False if log doesn’t contain an entry at prev_log_index
         # whose term matches prev_log_term
         try:
@@ -614,7 +628,7 @@ class Leader(State):
 
         # initialize request id
         self.request_id = generate_request_id()
-        self.response_map = {}
+        self.response_map = Cache(config.MAX_REQUEST_CACHE_LENGTH)
 
     def start(self):
         logger.info(f'{self.id} became a Leader for term {self.storage["term"]}.')
@@ -642,7 +656,7 @@ class Leader(State):
             if follower != self.id:
                 self.log.match_index.update({follower: 0})
 
-    async def append_entries(self, destination_id=None, reset_timer=False):
+    async def append_entries(self, request_id,  destination_id=None, reset_timer=False):
         """Handle an AppendEntries RPC to replicate log entries and handle heartbeats:
 
         args:
@@ -654,7 +668,7 @@ class Leader(State):
             - if the local (node's) next_index of the remote (node)
         """
         if destination_id:
-            destinations = [{'id': destination_id, 'address': self.members[destination_id]}]
+            destinations = [{'id': destination_id, 'address': self.raft.members[destination_id]}]
         else:
             destinations = []
             for k, v in self.raft.members.items():
@@ -672,7 +686,7 @@ class Leader(State):
                 'leader_id': self.id,
                 'sender_id': self.id,
                 'commit_index': self.log.commit_index,
-                'request_id': self.request_id
+                'request_id': request_id
             }
 
             next_index = self.log.next_index[f'{d_id}']
@@ -728,7 +742,9 @@ class Leader(State):
         # Send AppendEntries RPC to continue updating fast-forward log (data['success'] == False)
         # or in case there are new entries to sync (data['success'] == data['updated'] == True)
         if self.log.last_log_index >= self.log.next_index[sender_id]:
-            asyncio.ensure_future(self.append_entries(destination=sender_id), loop=self.loop)
+            request_id = generate_request_id()
+            self.state.response_map[request_id] = set()
+            asyncio.ensure_future(self.append_entries(request_id, destination_id=sender_id), loop=self.loop)
 
     @validate_term
     def handle_append_entries(self, data):
@@ -761,9 +777,9 @@ class Leader(State):
             self.log.commit_index = commited_on_majority
 
     def heartbeat(self):
-        self.request_id = generate_request_id()
-        self.response_map[self.request_id] = set()
-        asyncio.ensure_future(self.append_entries(), loop=self.loop)
+        request_id = generate_request_id()
+        self.response_map[request_id] = set()
+        asyncio.ensure_future(self.append_entries(request_id), loop=self.loop)
 
     @property
     def name(self):
@@ -831,7 +847,11 @@ class Raft:
                 f'message of type: {data["type"]}.'
             )
             return
-        handler(data)
+
+        try:
+            handler(data)
+        except Exception as e:
+            logger.error(f'{self.id} error in {self.name}.handle_{data["type"]}(): {e}')
 
     async def start(self):
         logger.info(
@@ -933,7 +953,9 @@ class Raft:
         """Write to log & send AppendEntries RPC"""
         self.apply_future = asyncio.Future(loop=self.loop)
         self.__write_log(self.state_storage['term'], command)
-        asyncio.ensure_future(self.state.append_entries(reset_timer=True), loop=self.loop)
+        request_id = generate_request_id()
+        self.state.response_map[request_id] = set()
+        asyncio.ensure_future(self.state.append_entries(request_id, reset_timer=True), loop=self.loop)
         await self.apply_future
 
     async def set_value(self, key, value):
